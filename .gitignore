@@ -1,4 +1,4 @@
 .vs/
 target/
 **/*.rs.bk
-.github/
+/.github/
