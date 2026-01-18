@@ -14,7 +14,8 @@
                     "--bin=clapscan"
                 ]
             },
-            "args": []
+            "args": [],
+            "console": "internalConsole"
         },
         {
             "name": "Debug unit tests in executable 'clapscan'",

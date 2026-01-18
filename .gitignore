@@ -1,5 +1,6 @@
 .vs/
 target/
 **/*.rs.bk
-/.github/
 .vscode/
+.github/
+*.yml
