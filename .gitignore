@@ -7,4 +7,5 @@ target/
 .vscode/
 .vscode
 workflows
-.github
+.vscode/launch.json
+.github/workflows
