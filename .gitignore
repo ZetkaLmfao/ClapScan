@@ -5,3 +5,6 @@ target/
 .github/
 *.yml
 .vscode/
+.vscode
+workflows
+.github
