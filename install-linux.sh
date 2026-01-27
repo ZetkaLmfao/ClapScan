@@ -14,6 +14,16 @@ if ! command -v cargo &> /dev/null; then
     exit 1
 fi
 
+# Check for required dependencies
+echo "Checking dependencies..."
+if ! pkg-config --exists openssl; then
+    echo "Error: OpenSSL development files not found!"
+    echo "Please install them:"
+    echo "  Ubuntu/Debian/Kali: sudo apt install libssl-dev pkg-config"
+    echo "  Fedora: sudo dnf install openssl-devel pkg-config"
+    exit 1
+fi
+
 # Build release version
 echo "Building ClapScan..."
 cargo build --release

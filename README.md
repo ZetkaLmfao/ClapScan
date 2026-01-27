@@ -27,11 +27,11 @@ clapscan --help
 #### Installation:
 
 ```bash
-# Install dependencies (Ubuntu/Debian)
-sudo apt install build-essential pkg-config libgtk-3-dev
+# Install dependencies (Ubuntu/Debian/Kali)
+sudo apt install build-essential pkg-config libgtk-3-dev libssl-dev
 
 # Install dependencies (Fedora)
-sudo dnf install gcc gtk3-devel
+sudo dnf install gcc gtk3-devel openssl-devel
 
 # Run installation script
 chmod +x install-linux.sh
