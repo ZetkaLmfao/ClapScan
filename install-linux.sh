@@ -24,6 +24,18 @@ if ! pkg-config --exists openssl; then
     exit 1
 fi
 
+# Check for ImageMagick (needed for icon conversion)
+if ! command -v convert &> /dev/null; then
+    echo "Installing ImageMagick for icon conversion..."
+    if command -v apt-get &> /dev/null; then
+        sudo apt install -y imagemagick
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y ImageMagick
+    else
+        echo "Please install ImageMagick manually to convert the icon"
+    fi
+fi
+
 # Build release version
 echo "Building ClapScan..."
 cargo build --release
