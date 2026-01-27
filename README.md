@@ -40,11 +40,6 @@ chmod +x install-linux.sh
 
 After installation, launch from application menu or run `clapscan` in terminal.
 
-#### Uninstall:
-```bash
-./uninstall-linux.sh
-```
-
 # Exemples 
 
 ```bash
