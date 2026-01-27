@@ -4,3 +4,4 @@ target/
 .vscode/
 .github/
 *.yml
+.vscode/
