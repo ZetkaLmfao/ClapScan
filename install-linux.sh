@@ -5,7 +5,17 @@ set -e
 
 echo "Installing ClapScan..."
 
+# Check if Rust is installed
+if ! command -v cargo &> /dev/null; then
+    echo "Error: Rust/Cargo not found!"
+    echo "Please install Rust first:"
+    echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    echo "Then restart your terminal and run this script again."
+    exit 1
+fi
+
 # Build release version
+echo "Building ClapScan..."
 cargo build --release
 
 # Create directories
