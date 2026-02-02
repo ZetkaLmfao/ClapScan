@@ -5,7 +5,7 @@
 ### Windows
 
 #### Method 1: Download and Run (Recommended):
-1. Download `clapscan.exe` from [Releases](https://github.com/SEU_USER/ClapScan/releases)
+1. Download `clapscan.exe` from [Releases](https://github.com/ZetkaLmfao/ClapScan/releases)
 2. Use: `.\clapscan.exe 127.0.0.1 -p 80`
 
 #### Method 2: Build from source:
