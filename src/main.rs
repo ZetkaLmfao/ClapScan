@@ -33,7 +33,7 @@ fn get_runtime() -> &'static tokio::runtime::Runtime {
 #[command(name = "clapscan", about = "Simple port scanner")]
 struct Args {
     #[arg(help = "Target hostname or IP to scan")]
-    target: String,
+    target: Option<String>,
 
     #[arg(short = 'p', long = "ports", default_value = "1-1000", help = "Ports or ranges (e.g. 80,443 or 1-1024)")]
     ports: String,
@@ -61,6 +61,9 @@ struct Args {
 
     #[arg(long = "ssh-out", help = "Optional CSV output file for --ssh-banners results")]
     ssh_out: Option<String>,
+
+    #[arg(short = 'a', long = "batch", help = "Batch scan: path to file with targets (one per line)")]
+    batch_file: Option<String>,
 
 }
 #[derive(Serialize, Clone)]
@@ -133,6 +136,190 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+async fn batch_scan(args: &Args, batch_path: &str) -> anyhow::Result<()> {
+    batch_scan_to_channel(args, batch_path, None).await
+}
+
+async fn batch_scan_to_channel(args: &Args, batch_path: &str, tx: Option<Sender<String>>) -> anyhow::Result<()> {
+    let content = fs::read_to_string(batch_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read batch file: {}", e))?;
+    
+    let targets: Vec<&str> = content
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    
+    if targets.is_empty() {
+        anyhow::bail!("No targets found in batch file");
+    }
+    
+    let msg = format!("[BATCH] File loaded with {} targets loaded\n", targets.len());
+    let _ = tx.as_ref().map(|s| s.send(msg.clone()));
+    println!("{}", msg.trim());
+    
+    let mut all_findings = Vec::new();
+    
+    for (idx, target) in targets.iter().enumerate() {
+        let status_msg = format!("[BATCH] [{}/{}] Scanning: {}\n", idx + 1, targets.len(), target);
+        let _ = tx.as_ref().map(|s| s.send(status_msg.clone()));
+        println!("{}", status_msg.trim());
+        
+        let start_msg = format!("Resolving: {}\n", target);
+        let _ = tx.as_ref().map(|s| s.send(start_msg.clone()));
+        
+        match scan_target_to_channel(target, args, tx.clone()).await {
+            Ok(findings) => {
+                all_findings.extend(findings.clone());
+                
+                if findings.is_empty() {
+                    let empty_msg = "  No open ports found\n";
+                    let _ = tx.as_ref().map(|s| s.send(empty_msg.to_string()));
+                    println!("{}", empty_msg.trim());
+                }
+                
+                if args.os_detect {
+                    if let Some(os) = detect_os(&findings) {
+                        let os_msg = format!("[OS DETECTION]\n  {}\n", os.name);
+                        let _ = tx.as_ref().map(|s| s.send(os_msg.clone()));
+                        println!("{}", os_msg.trim());
+                    }
+                }
+                
+                if args.fuzz && !findings.is_empty() {
+                    let finding = findings.first().unwrap();
+                    match run_fuzzing(target, finding.port, args.wordlist.as_ref()).await {
+                        Ok(logs) => {
+                            for l in logs {
+                                let fuzzing_msg = format!("{}\n", l);
+                                let _ = tx.as_ref().map(|s| s.send(fuzzing_msg.clone()));
+                                println!("{}", fuzzing_msg.trim());
+                            }
+                        }
+                        Err(e) => {
+                            let error_msg = format!("[FUZZ ERROR] {}\n", e);
+                            let _ = tx.as_ref().map(|s| s.send(error_msg.clone()));
+                            eprintln!("{}", error_msg.trim());
+                        }
+                    }
+                }
+                
+                let _ = tx.as_ref().map(|s| s.send("\n".to_string()));
+            }
+            Err(e) => {
+                let error_msg = format!("[ERROR] Error scanning {}: {}\n", target, e);
+                let _ = tx.as_ref().map(|s| s.send(error_msg.clone()));
+                eprintln!("{}", error_msg.trim());
+            }
+        }
+    }
+    
+    let complete_msg = "[BATCH] Scan complete!\n";
+    let _ = tx.as_ref().map(|s| s.send(complete_msg.to_string()));
+    println!("{}", complete_msg.trim());
+    
+    if args.json {
+        let json_output = serde_json::to_string_pretty(&all_findings)?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let filename = format!("scan_results_{}.json", timestamp);
+        fs::write(&filename, json_output)?;
+        let save_msg = format!("Results saved to: {}\n", filename);
+        let _ = tx.as_ref().map(|s| s.send(save_msg.clone()));
+        println!("{}", save_msg.trim());
+    }
+    
+    Ok(())
+}
+
+/// Scan a single target with channel output for batch scanning
+async fn scan_target_to_channel(target: &str, args: &Args, tx: Option<Sender<String>>) -> anyhow::Result<Vec<Finding>> {
+    let ports = parse_ports(&args.ports)?;
+    let timeout = Duration::from_millis(args.timeout_ms);
+    let target_host = target.to_string();
+    
+    let ip = resolve_host(target).await?;
+    let ip_msg = format!("IP: {}\n", ip);
+    let _ = tx.as_ref().map(|s| s.send(ip_msg.clone()));
+    println!("{}", ip_msg.trim());
+    
+    let scan_msg = format!("Scanning {} ports...\n", ports.len());
+    let _ = tx.as_ref().map(|s| s.send(scan_msg.clone()));
+    println!("{}", scan_msg.trim());
+    
+    let tasks = ports.into_iter().map(|port| {
+        let ip = ip;
+        let timeout = timeout;
+        let host_for_http = target_host.clone();
+        async move {
+            let addr = SocketAddr::new(ip, port);
+            match time::timeout(timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(mut stream)) => {
+                    let mut buf = [0u8; 128];
+                    let banner = match time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
+                        Ok(Ok(n)) if n > 0 => {
+                            let text = String::from_utf8_lossy(&buf[..n]);
+                            let cleaned = text
+                                .chars()
+                                .map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '.' })
+                                .collect::<String>()
+                                .trim()
+                                .to_string();
+                            if cleaned.is_empty() { None } else { Some(cleaned) }
+                        }
+                        _ => None,
+                    };
+                    let service_name = guess_service(port, &banner);
+                    let service = match service_name.as_deref() {
+                        Some("http") => {
+                            match http_head_probe(ip, port, &host_for_http).await {
+                                Ok(resp) => Some(fingerprint_http(&resp)),
+                                Err(_) => banner.as_ref().map(|b| fingerprint_http(b)),
+                            }
+                        }
+                        Some("ftp") => {
+                            banner.as_ref().map(|b| fingerprint_ftp(b))
+                        }
+                        _ => None,
+                    };
+                    Some(Finding {
+                        host: ip.to_string(),
+                        port,
+                        status: "open",
+                        banner,
+                        service,
+                    })
+                }
+                _ => None,
+            }
+        }
+    });
+    
+    let results: Vec<Finding> = stream::iter(tasks)
+        .buffer_unordered(args.concurrency)
+        .filter_map(|x| async move { x })
+        .collect()
+        .await;
+    
+    for r in &results {
+        match &r.banner {
+            Some(b) => {
+                let msg = format!("{}:{} open | {}\n", r.host, r.port, b);
+                let _ = tx.as_ref().map(|s| s.send(msg.clone()));
+                println!("{}", msg.trim());
+            }
+            None => {
+                let msg = format!("{}:{} open\n", r.host, r.port);
+                let _ = tx.as_ref().map(|s| s.send(msg.clone()));
+                println!("{}", msg.trim());
+            }
+        }
+    }
+    
+    Ok(results)
+}
+
 /// Main async entry point: handles CLI args, dispatches scan/fuzz modes, and outputs results.
 async fn async_main() -> anyhow::Result<()> {
     if env::args().any(|arg| arg == "--install") {
@@ -144,6 +331,14 @@ async fn async_main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    if let Some(ref batch_path) = args.batch_file {
+        return batch_scan(&args, batch_path).await;
+    }
+
+    let target = args.target.clone().ok_or_else(|| {
+        anyhow::anyhow!("Target required. Use: clapscan <target> [options] or clapscan -a <file>")
+    })?;
+
     if let Some(ref path) = args.ssh_banners {
         capture_ssh_banners_from_file(path, args.ssh_out.as_deref()).await?;
         return Ok(());
@@ -154,10 +349,10 @@ async fn async_main() -> anyhow::Result<()> {
         anyhow::bail!("--fuzz requires exactly one port (e.g. -p 80)");
     }
     let timeout = Duration::from_millis(args.timeout_ms);
-    let target_host = args.target.clone();
+    let target_host = target.clone();
 
-    println!("Starting scan of {} ({} ports)...", args.target, ports.len());
-    let ip = resolve_host(&args.target).await?;
+    println!("Starting scan of {} ({} ports)...", target, ports.len());
+    let ip = resolve_host(&target).await?;
     println!("Target IP: {}", ip);
 
     let tasks = ports.into_iter().map(|port| {
@@ -268,7 +463,7 @@ async fn async_main() -> anyhow::Result<()> {
         for r in &results {
             for m in &modules {
                 if m.supports_port(r.port) {
-                    let mut checks = m.run(&args.target, r.port).await?;
+                    let mut checks = m.run(&target, r.port).await?;
                     module_findings.append(&mut checks);
                 }
             }
@@ -283,13 +478,13 @@ async fn async_main() -> anyhow::Result<()> {
                 println!("  - {}", ev);
             }
             if c.vulnerable && c.name == "HTTP PUT Enabled" {
-                let poc = poc_http_put(&c.target, c.port).await?;
+                let poc = poc_http_put(&target, c.port).await?;
                 println!("  [POC] {}", poc);
             }
         }
 
         let logs = run_fuzzing(
-            &args.target,
+            &target,
             finding.port,
             args.wordlist.as_ref(),
         ).await?;
@@ -536,6 +731,8 @@ struct ClapScanApp {
     ssh_csv_out: String,
     dark_mode: bool,
     last_results: String,
+    batch_file: String,
+    use_batch: bool,
 }
 
 impl Default for ClapScanApp {
@@ -555,6 +752,8 @@ impl Default for ClapScanApp {
             ssh_csv_out: String::new(),
             dark_mode: true,
             last_results: String::new(),
+            batch_file: String::new(),
+            use_batch: false,
         }
     }
 }
@@ -610,10 +809,22 @@ impl eframe::App for ClapScanApp {
                             ui.group(|ui| {
                                 ui.vertical(|ui| {
                                     ui.label("Target Configuration");
+                                    
                                     ui.horizontal(|ui| {
-                                        ui.label("Target:");
-                                        ui.text_edit_singleline(&mut self.target);
+                                        ui.checkbox(&mut self.use_batch, "Batch Scan");
                                     });
+                                    
+                                    if self.use_batch {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Batch File:");
+                                            ui.text_edit_singleline(&mut self.batch_file);
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Target:");
+                                            ui.text_edit_singleline(&mut self.target);
+                                        });
+                                    }
 
                                     ui.horizontal(|ui| {
                                         ui.label("Ports:");
@@ -640,25 +851,59 @@ impl eframe::App for ClapScanApp {
                             ui.horizontal(|ui| {
                                 if ui.button("START SCAN").clicked() && !self.scanning {
                                     self.output.clear();
-                                    self.output.push_str("[SCAN] Starting scan...\\n");
+                                    self.output.push_str("[SCAN] Starting scan...\n");
                                     self.scanning = true;
 
-                                    let target = self.target.clone();
-                                    let ports = if self.ports.is_empty() { "1-1000".into() } else { self.ports.clone() };
-                                    let enable_fuzz = self.enable_fuzz;
-                                    let wordlist = if self.wordlist.trim().is_empty() { None } else { Some(self.wordlist.trim().to_string()) };
-                                    let enable_os_detect = self.enable_os_detect;
+                                    if self.use_batch {
+                                        let batch_file = self.batch_file.clone();
+                                        let ports = if self.ports.is_empty() { "1-1000".into() } else { self.ports.clone() };
+                                        let enable_fuzz = self.enable_fuzz;
+                                        let wordlist = if self.wordlist.trim().is_empty() { None } else { Some(self.wordlist.trim().to_string()) };
+                                        let enable_os_detect = self.enable_os_detect;
 
-                                    let (tx, rx) = mpsc::channel();
-                                    self.rx = Some(rx);
+                                        let (tx, rx) = mpsc::channel();
+                                        self.rx = Some(rx);
 
-                                    std::thread::spawn(move || {
-                                        let rt = get_runtime();
-                                        if let Err(e) = rt.block_on(scan_to_channel(target, ports, tx.clone(), enable_fuzz, wordlist, enable_os_detect)) {
-                                            let _ = tx.send(format!("[ERROR] {e}\\n"));
-                                        }
-                                        let _ = tx.send("__DONE__".to_string());
-                                    });
+                                        std::thread::spawn(move || {
+                                            let rt = get_runtime();
+                                            let temp_args = Args {
+                                                target: None,
+                                                ports,
+                                                concurrency: 200,
+                                                timeout_ms: 1000,
+                                                json: false,
+                                                fuzz: enable_fuzz,
+                                                wordlist,
+                                                os_detect: enable_os_detect,
+                                                ssh_banners: None,
+                                                ssh_out: None,
+                                                batch_file: Some(batch_file.clone()),
+                                            };
+                                            if let Err(e) = rt.block_on(async {
+                                                batch_scan_to_channel(&temp_args, &batch_file, Some(tx.clone())).await
+                                            }) {
+                                                let _ = tx.send(format!("[ERROR] {e}\\n"));
+                                            }
+                                            let _ = tx.send("__DONE__".to_string());
+                                        });
+                                    } else {
+                                        let target = self.target.clone();
+                                        let ports = if self.ports.is_empty() { "1-1000".into() } else { self.ports.clone() };
+                                        let enable_fuzz = self.enable_fuzz;
+                                        let wordlist = if self.wordlist.trim().is_empty() { None } else { Some(self.wordlist.trim().to_string()) };
+                                        let enable_os_detect = self.enable_os_detect;
+
+                                        let (tx, rx) = mpsc::channel();
+                                        self.rx = Some(rx);
+
+                                        std::thread::spawn(move || {
+                                            let rt = get_runtime();
+                                            if let Err(e) = rt.block_on(scan_to_channel(target, ports, tx.clone(), enable_fuzz, wordlist, enable_os_detect)) {
+                                                let _ = tx.send(format!("[ERROR] {e}\\n"));
+                                            }
+                                            let _ = tx.send("__DONE__".to_string());
+                                        });
+                                    }
                                 }
 
                                 if ui.button("STOP").clicked() && self.scanning {
@@ -739,7 +984,7 @@ async fn run_fuzzing(
     port: u16,
     wordlist: Option<&String>,
 ) -> anyhow::Result<Vec<String>> {
-    let mut logs = Vec::new();
+    let mut logs = Vec::new();\
     logs.push(format!("[FUZZ] Starting fuzzing on {}:{}", target, port));
 
     match port {
@@ -1170,7 +1415,7 @@ async fn fuzz_user_agent(
         }
 
         if status != first_status {
-            results.push(format!("[FUZZ-UA] 🔴 FILTERED: UA '{}' returned {} (others return {})", ua, status, first_status));
+            results.push(format!("[FUZZ-UA] FILTERED: UA '{}' returned {} (others return {})", ua, status, first_status));
         }
     }
 
@@ -2533,7 +2778,6 @@ async fn analyze_ssh_banner(banner: &str) -> Vec<String> {
     logs
 }
 
-/// Reads host list, captures SSH banners, analyzes each, and optionally writes CSV output.
 async fn capture_ssh_banners_from_file(path: &str, out_csv: Option<&str>) -> anyhow::Result<()> {
     let content = fs::read_to_string(path)?;
     println!("[SSH-BANNERS] Reading targets from: {}", path);
@@ -5519,7 +5763,7 @@ async fn fuzz_dns_vulnerabilities(target: &str, port: u16) -> anyhow::Result<Vec
         }
     }
 
-    if logs.iter().any(|l| l.contains("Recursion available")) {
+    if logs.iter().any(|l| l.contains("Recursion available")) {+
         logs.push("[FUZZ-DNS]  Recursion without DNSSEC can enable cache poisoning/spoofing.".into());
     }
 
